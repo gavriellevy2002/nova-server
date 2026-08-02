@@ -22,3 +22,8 @@ services:
         sync: false
       - key: ELEVEN_KEY
         sync: false
+      - key: ELEVEN_VOICE
+        sync: false
+      # must match the disk mountPath above, or state is wiped on every deploy
+      - key: DATA_DIR
+        value: /app/data

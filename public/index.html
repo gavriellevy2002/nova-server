@@ -369,7 +369,11 @@ async function speakEleven(say) {
       headers:{ 'Content-Type':'application/json', 'x-nova-token': TOKEN },
       body: JSON.stringify({ text: say, lang: LANG })
     });
-    if (!r.ok) throw new Error('tts ' + r.status);
+    if (!r.ok) {
+      let reason = 'other';
+      try { reason = (await r.json()).reason || 'other'; } catch (e) {}
+      const err = new Error('tts ' + r.status); err.reason = reason; throw err;
+    }
     const blob = await r.blob();
     if (!blob.size) throw new Error('empty audio');
 
@@ -387,7 +391,14 @@ async function speakEleven(say) {
     elFails = 0;
   } catch (e) {
     elFails++;
-    if (elFails === 2) add('n', 'Human voice unavailable — falling back to the built-in voice. Check ELEVEN_KEY on Render, or your ElevenLabs credits.', true);
+    if (elFails === 1) {
+      const why = e.reason === 'credits'
+        ? 'Your ElevenLabs credits ran out, so I switched to the built-in voice. Open ☰ to see the exact balance and reset date.'
+        : e.reason === 'auth'
+        ? 'ElevenLabs rejected the key. Check ELEVEN_KEY on Render — and that the key has Text to Speech + Voices:Read permission.'
+        : 'Human voice hiccuped, using the built-in voice for now.';
+      add('n', why, true);
+    }
     speakBrowser(say);
   }
 }
@@ -761,8 +772,39 @@ async function openMenu() {
     '<b>Server status</b><br>' +
     'Brain: ' + esc(health.model || '—') + '<br>' +
     'Email sending: ' + (health.email ? '<span style="color:var(--teal)">on ✓</span>' : '<span style="color:var(--red)">off ✕</span>') + '<br>' +
-    'Scheduled tasks: ' + (tasks.length || 0);
+    'Scheduled tasks: ' + (tasks.length || 0) + '<br>' +
+    'Memory: ' + (health.memories || 0) + ' facts, ' + (health.contacts || 0) + ' contacts<br>' +
+    'Storage: ' + (health.persisted
+      ? '<span style="color:var(--teal)">persistent ✓</span>'
+      : '<span style="color:var(--red)">NOT persistent ✕ — everything resets on deploy</span>') +
+    ' <span style="color:var(--dim)">(boot #' + (health.boots || '?') + ')</span>';
   b.appendChild(status);
+
+  if (health.voice) {
+    const uc = document.createElement('div');
+    uc.className = 'card';
+    uc.innerHTML = '<b>ElevenLabs credits</b><div class="muted" style="margin-top:6px">Checking…</div>';
+    b.appendChild(uc);
+    fetch('/api/usage', { headers:{ 'x-nova-token': TOKEN } })
+      .then(r => r.json())
+      .then(u => {
+        if (u.error) throw new Error(u.error);
+        const low = u.limit && u.remaining / u.limit < 0.1;
+        const reset = u.resetsAt ? new Date(u.resetsAt).toLocaleDateString(undefined,{month:'short',day:'numeric'}) : '—';
+        uc.innerHTML = '<b>ElevenLabs credits</b>' +
+          '<div style="margin-top:8px;font-size:22px;font-weight:600;color:' +
+            (low ? 'var(--red)' : 'var(--teal)') + '">' + u.remaining.toLocaleString() + '</div>' +
+          '<div class="muted">left of ' + u.limit.toLocaleString() + ' · ' + u.pct + '% used · ' +
+          esc(u.tier) + ' plan · resets ' + reset + '</div>' +
+          '<div style="margin-top:9px;height:6px;border-radius:4px;background:rgba(150,140,255,.18);overflow:hidden">' +
+            '<div style="height:100%;width:' + Math.min(100, u.pct) + '%;background:' +
+            (low ? 'var(--red)' : 'var(--teal)') + '"></div></div>' +
+          (low ? '<div class="muted" style="margin-top:8px;color:var(--red)">Almost out — she will fall back to the built-in voice.</div>' : '');
+      })
+      .catch(e => {
+        uc.innerHTML = '<b>ElevenLabs credits</b><div class="muted" style="margin-top:6px">Could not read usage: ' + esc(e.message) + '</div>';
+      });
+  }
 
   const engine = health.voiceReady ? 'Human voice — ElevenLabs ✓'
                : health.voice      ? 'ElevenLabs connected — pick a voice below'

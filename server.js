@@ -23,7 +23,18 @@ const MODEL      = process.env.MODEL || 'claude-sonnet-4-5';
 const TOKEN      = process.env.NOVA_TOKEN || '';           // shared secret phone/mac must send
 const OWNER_MAIL = process.env.OWNER_EMAIL || '';          // where "email me" goes
 const TAVILY     = process.env.TAVILY_KEY || '';
-const DATA_DIR   = process.env.DATA_DIR || path.join(__dirname, 'data');
+// Where state lives. This MUST land on Render's mounted disk, otherwise every
+// redeploy silently wipes memory, contacts, scheduled tasks and the voice choice.
+// render.yaml mounts the disk at /app/data, but the app itself runs from a
+// different directory, so __dirname/data is NOT the disk. Detect the mount.
+function pickDataDir() {
+  if (process.env.DATA_DIR) return process.env.DATA_DIR;
+  for (const c of ['/app/data', '/var/data']) {
+    try { if (fs.statSync(c).isDirectory()) return c; } catch {}
+  }
+  return path.join(__dirname, 'data');
+}
+const DATA_DIR = pickDataDir();
 
 // ---------- ElevenLabs (human voice) ----------
 // NOTE: as of 2026 only `eleven_v3` supports Hebrew. The flash models are far
@@ -40,7 +51,18 @@ if (!TOKEN) console.error('\n⚠️  missing NOVA_TOKEN — anyone could use thi
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const FILE = n => path.join(DATA_DIR, n);
 function loadJSON(n, def) { try { return JSON.parse(fs.readFileSync(FILE(n), 'utf8')); } catch { return def; } }
-function saveJSON(n, v) { fs.writeFileSync(FILE(n), JSON.stringify(v, null, 2)); }
+function saveJSON(n, v) {
+  try { fs.writeFileSync(FILE(n), JSON.stringify(v, null, 2)); }
+  catch (e) { console.error('could not save ' + n + ' to ' + DATA_DIR + ':', e.message); }
+}
+
+// Boot counter — the honest test of whether state actually survives a redeploy.
+// If this stays at 1 forever, the disk is not mounted where we think it is.
+const bootInfo = loadJSON('boot.json', { boots: 0, first: null });
+bootInfo.boots += 1;
+if (!bootInfo.first) bootInfo.first = new Date().toISOString();
+bootInfo.last = new Date().toISOString();
+saveJSON('boot.json', bootInfo);
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -251,6 +273,22 @@ async function elVoices() {
   }));
 }
 
+async function elUsage() {
+  if (!EL_KEY) return null;
+  const r = await fetchT(EL_BASE + '/user/subscription', { headers: { 'xi-api-key': EL_KEY } }, 12000);
+  if (!r.ok) throw new Error('elevenlabs usage ' + r.status);
+  const j = await r.json();
+  const used = j.character_count || 0, limit = j.character_limit || 0;
+  return {
+    tier: j.tier || 'free',
+    used, limit,
+    remaining: Math.max(0, limit - used),
+    pct: limit ? Math.round((used / limit) * 100) : 0,
+    resetsAt: j.next_character_count_reset_unix
+      ? new Date(j.next_character_count_reset_unix * 1000).toISOString() : null
+  };
+}
+
 async function elTTS(text, lang) {
   if (!EL_KEY) throw new Error('no ELEVEN_KEY');
   const voiceId = settings.voiceId;
@@ -285,8 +323,12 @@ async function elTTS(text, lang) {
       if (!r.ok) {
         const detail = await r.text().catch(() => '');
         lastErr = new Error('elevenlabs ' + r.status + ' (' + model_id + ') ' + detail.slice(0, 220));
-        // 401/403 = key or plan problem: no point retrying another model
-        if (r.status === 401 || r.status === 403) break;
+        lastErr.status = r.status;
+        // classify so the app can say something useful instead of "tts 503"
+        if (/quota|credit|exceed/i.test(detail) || r.status === 429) lastErr.reason = 'credits';
+        else if (r.status === 401 || r.status === 403) lastErr.reason = 'auth';
+        else lastErr.reason = 'other';
+        if (lastErr.reason !== 'other') break;   // key/quota problems won't fix themselves
         continue;
       }
       const buf = Buffer.from(await r.arrayBuffer());
@@ -314,8 +356,16 @@ function auth(req, res, next) {
 
 app.get('/health', (req, res) => res.json({
   ok: true, model: MODEL, email: !!mailer, tasks: tasks.length,
-  voice: !!EL_KEY, voiceReady: !!(EL_KEY && settings.voiceId), voiceId: settings.voiceId || ''
+  voice: !!EL_KEY, voiceReady: !!(EL_KEY && settings.voiceId), voiceId: settings.voiceId || '',
+  dataDir: DATA_DIR, boots: bootInfo.boots,
+  persisted: DATA_DIR === '/app/data' || DATA_DIR === '/var/data' || !!process.env.DATA_DIR,
+  memories: memory.facts.length, contacts: memory.contacts.length
 }));
+
+app.get('/api/usage', auth, async (req, res) => {
+  try { res.json(await elUsage() || { error: 'no key' }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ---------- voice ----------
 app.get('/api/voices', auth, async (req, res) => {
@@ -338,7 +388,8 @@ app.post('/api/speak', auth, async (req, res) => {
     res.send(buf);
   } catch (e) {
     console.error('tts:', e.message);
-    res.status(503).json({ error: e.message });   // client falls back to browser voice
+    // client falls back to the browser voice, but now it can say WHY
+    res.status(503).json({ error: e.message, reason: e.reason || 'other' });
   }
 });
 
@@ -369,5 +420,8 @@ app.get('/api/tasks', auth, (req, res) => res.json(tasks));
 app.listen(PORT, () => {
   console.log(`\n✦ NOVA agent server on :${PORT}`);
   const v = !EL_KEY ? 'browser (free)' : (settings.voiceId ? 'ElevenLabs ✓' : 'ElevenLabs — pick a voice in ☰');
-  console.log(`  model ${MODEL} · email ${mailer ? 'on' : 'off'} · tasks ${tasks.length} · token ${TOKEN ? 'set' : 'MISSING'} · voice ${v}\n`);
+  console.log(`  model ${MODEL} · email ${mailer ? 'on' : 'off'} · tasks ${tasks.length} · token ${TOKEN ? 'set' : 'MISSING'} · voice ${v}`);
+  console.log(`  data  ${DATA_DIR}  (boot #${bootInfo.boots}, ${memory.facts.length} memories, ${tasks.length} tasks)`);
+  if (bootInfo.boots === 1) console.log('  ⚠ first boot on this storage — if this says #1 after every deploy, the disk is NOT persisting\n');
+  else console.log('');
 });

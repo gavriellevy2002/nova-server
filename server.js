@@ -25,6 +25,15 @@ const OWNER_MAIL = process.env.OWNER_EMAIL || '';          // where "email me" g
 const TAVILY     = process.env.TAVILY_KEY || '';
 const DATA_DIR   = process.env.DATA_DIR || path.join(__dirname, 'data');
 
+// ---------- ElevenLabs (human voice) ----------
+// NOTE: as of 2026 only `eleven_v3` supports Hebrew. The flash models are far
+// cheaper/faster but English-only-ish, so we pick per language and fall back.
+const EL_KEY      = process.env.ELEVEN_KEY || '';
+const EL_MODEL_HE = process.env.ELEVEN_MODEL_HE || 'eleven_v3';
+const EL_MODEL_EN = process.env.ELEVEN_MODEL_EN || 'eleven_flash_v2_5';
+const EL_FALLBACK = 'eleven_multilingual_v2';
+const EL_MAX_CHARS = Number(process.env.ELEVEN_MAX_CHARS || 1200);   // cost guard
+
 if (!process.env.ANTHROPIC_API_KEY) console.error('\n⚠️  missing ANTHROPIC_API_KEY\n');
 if (!TOKEN) console.error('\n⚠️  missing NOVA_TOKEN — anyone could use this server. Set one.\n');
 
@@ -67,6 +76,11 @@ function knownContact(email) {
 function addContact(email) {
   if (email && !knownContact(email)) { memory.contacts.push(email); saveJSON('memory.json', memory); }
 }
+
+// ---------- settings (voice choice etc.) ----------
+let settings = loadJSON('settings.json', { voiceId: process.env.ELEVEN_VOICE || '' });
+if (!settings.voiceId && process.env.ELEVEN_VOICE) settings.voiceId = process.env.ELEVEN_VOICE;
+function saveSettings() { saveJSON('settings.json', settings); }
 
 // ---------- pending approvals (email to NEW people) ----------
 let pending = loadJSON('pending.json', []);
@@ -206,6 +220,85 @@ async function brain(messages, autonomous) {
 }
 
 // ============================================================
+//  VOICE  (ElevenLabs, server-side so the key never hits the browser)
+// ============================================================
+const EL_BASE = 'https://api.elevenlabs.io/v1';
+
+// tiny LRU so replaying the same line doesn't cost credits twice
+const audioCache = new Map();
+const AUDIO_CACHE_MAX = 40;
+function cacheGet(k) {
+  if (!audioCache.has(k)) return null;
+  const v = audioCache.get(k);
+  audioCache.delete(k); audioCache.set(k, v);   // refresh recency
+  return v;
+}
+function cachePut(k, buf) {
+  audioCache.set(k, buf);
+  while (audioCache.size > AUDIO_CACHE_MAX) audioCache.delete(audioCache.keys().next().value);
+}
+
+async function elVoices() {
+  if (!EL_KEY) return [];
+  const r = await fetchT(EL_BASE + '/voices', { headers: { 'xi-api-key': EL_KEY } }, 12000);
+  if (!r.ok) throw new Error('elevenlabs voices ' + r.status);
+  const j = await r.json();
+  return (j.voices || []).map(v => ({
+    id: v.voice_id,
+    name: v.name,
+    labels: v.labels || {},
+    preview: v.preview_url || ''
+  }));
+}
+
+async function elTTS(text, lang) {
+  if (!EL_KEY) throw new Error('no ELEVEN_KEY');
+  const voiceId = settings.voiceId;
+  if (!voiceId) throw new Error('no voice selected');
+
+  const say = String(text || '').slice(0, EL_MAX_CHARS);
+  if (!say.trim()) throw new Error('empty text');
+
+  const primary = lang === 'he' ? EL_MODEL_HE : EL_MODEL_EN;
+  const chain = [primary, EL_FALLBACK].filter((m, i, a) => a.indexOf(m) === i);
+
+  const key = crypto.createHash('sha1').update(voiceId + '|' + primary + '|' + say).digest('hex');
+  const hit = cacheGet(key);
+  if (hit) return hit;
+
+  let lastErr = null;
+  for (const model_id of chain) {
+    try {
+      const r = await fetchT(
+        EL_BASE + '/text-to-speech/' + encodeURIComponent(voiceId) + '?output_format=mp3_44100_128',
+        {
+          method: 'POST',
+          headers: { 'xi-api-key': EL_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+          body: JSON.stringify({
+            text: say,
+            model_id,
+            voice_settings: { stability: 0.45, similarity_boost: 0.75, style: 0.25, use_speaker_boost: true }
+          })
+        },
+        30000
+      );
+      if (!r.ok) {
+        const detail = await r.text().catch(() => '');
+        lastErr = new Error('elevenlabs ' + r.status + ' (' + model_id + ') ' + detail.slice(0, 220));
+        // 401/403 = key or plan problem: no point retrying another model
+        if (r.status === 401 || r.status === 403) break;
+        continue;
+      }
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (!buf.length) { lastErr = new Error('empty audio'); continue; }
+      cachePut(key, buf);
+      return buf;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('tts failed');
+}
+
+// ============================================================
 //  HTTP
 // ============================================================
 const app = express();
@@ -219,7 +312,35 @@ function auth(req, res, next) {
   next();
 }
 
-app.get('/health', (req, res) => res.json({ ok: true, model: MODEL, email: !!mailer, tasks: tasks.length }));
+app.get('/health', (req, res) => res.json({
+  ok: true, model: MODEL, email: !!mailer, tasks: tasks.length,
+  voice: !!EL_KEY, voiceReady: !!(EL_KEY && settings.voiceId), voiceId: settings.voiceId || ''
+}));
+
+// ---------- voice ----------
+app.get('/api/voices', auth, async (req, res) => {
+  try { res.json({ voices: await elVoices(), current: settings.voiceId || '' }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/voice', auth, (req, res) => {
+  const id = String(req.body.voiceId || '').trim();
+  if (!id) return res.status(400).json({ error: 'voiceId required' });
+  settings.voiceId = id; saveSettings();
+  res.json({ ok: true, voiceId: id });
+});
+
+app.post('/api/speak', auth, async (req, res) => {
+  try {
+    const buf = await elTTS(req.body.text, req.body.lang === 'he' ? 'he' : 'en');
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'no-store');
+    res.send(buf);
+  } catch (e) {
+    console.error('tts:', e.message);
+    res.status(503).json({ error: e.message });   // client falls back to browser voice
+  }
+});
 
 const conv = []; // simple shared history for the built-in UI
 app.post('/api/chat', auth, async (req, res) => {
@@ -247,5 +368,6 @@ app.get('/api/tasks', auth, (req, res) => res.json(tasks));
 
 app.listen(PORT, () => {
   console.log(`\n✦ NOVA agent server on :${PORT}`);
-  console.log(`  model ${MODEL} · email ${mailer ? 'on' : 'off'} · tasks ${tasks.length} · token ${TOKEN ? 'set' : 'MISSING'}\n`);
+  const v = !EL_KEY ? 'browser (free)' : (settings.voiceId ? 'ElevenLabs ✓' : 'ElevenLabs — pick a voice in ☰');
+  console.log(`  model ${MODEL} · email ${mailer ? 'on' : 'off'} · tasks ${tasks.length} · token ${TOKEN ? 'set' : 'MISSING'} · voice ${v}\n`);
 });

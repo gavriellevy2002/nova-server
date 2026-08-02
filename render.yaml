@@ -20,3 +20,5 @@ services:
         sync: false
       - key: SMTP_PASS
         sync: false
+      - key: ELEVEN_KEY
+        sync: false

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<title>Nova</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#06040f">
+<style>
+  :root{--bg:#06040f;--ink:#e9e6ff;--dim:#8b86ad;--teal:#4be8d0;--sb:env(safe-area-inset-bottom,0)}
+  *{margin:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;font-family:-apple-system,"SF Pro Text",Roboto,sans-serif}
+  body{background:radial-gradient(80% 60% at 50% 20%,#120c2c,#06040f);color:var(--ink);height:100vh;display:flex;flex-direction:column}
+  header{padding:calc(env(safe-area-inset-top,0) + 12px) 16px 10px;display:flex;justify-content:space-between;align-items:center}
+  header b{font-family:Georgia,serif;letter-spacing:.4em}header b i{color:var(--teal);font-style:normal}
+  #pend{font-size:12px;color:#fcd34d;text-decoration:none}
+  #log{flex:1;overflow:auto;padding:10px 14px;display:flex;flex-direction:column;gap:9px}
+  .m{max-width:88%;padding:10px 13px;border-radius:15px;font-size:15px;line-height:1.55;white-space:pre-wrap;unicode-bidi:plaintext}
+  .u{align-self:flex-start;background:#2a2352;border-bottom-right-radius:4px}
+  .n{align-self:flex-end;background:rgba(75,232,208,.1);border:1px solid rgba(75,232,208,.2);border-bottom-left-radius:4px}
+  form{display:flex;gap:8px;padding:10px 12px calc(var(--sb) + 12px)}
+  input{flex:1;background:rgba(150,140,255,.09);border:1px solid rgba(150,140,255,.2);border-radius:999px;color:var(--ink);padding:14px 18px;font-size:16px;outline:none}
+  button{background:var(--teal);border:none;color:#04110e;font-weight:700;border-radius:999px;padding:0 20px;font-size:16px}
+  #gate{position:fixed;inset:0;background:#06040f;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;padding:24px;z-index:9}
+  #gate input{width:min(360px,90vw);text-align:center}
+  #gate.hide{display:none}
+</style>
+</head>
+<body>
+<div id="gate">
+  <div style="font-family:Georgia,serif;letter-spacing:.4em;font-size:20px">N O V A</div>
+  <div style="color:var(--dim);font-size:13px">הדבק את קוד הגישה (NOVA_TOKEN)</div>
+  <input id="tok" placeholder="token" autocapitalize="off" autocorrect="off">
+  <button onclick="saveTok()">כניסה</button>
+</div>
+<header><b>N O V A <i>✦</i></b><a id="pend" href="#" onclick="showPending();return false"></a></header>
+<div id="log"></div>
+<form onsubmit="send(event)"><input id="in" placeholder="דבר עם נובה…" autocomplete="off"><button>שלח</button></form>
+<script>
+const $=s=>document.querySelector(s);
+let TOKEN=localStorage.getItem('nv_tok')||'';
+if(TOKEN)$('#gate').classList.add('hide');
+function saveTok(){TOKEN=$('#tok').value.trim();localStorage.setItem('nv_tok',TOKEN);$('#gate').classList.add('hide');refreshPending();}
+function add(who,t){const d=document.createElement('div');d.className='m '+who;d.textContent=t;$('#log').appendChild(d);$('#log').scrollTop=1e9;return d;}
+async function send(e){e.preventDefault();const v=$('#in').value.trim();if(!v)return;$('#in').value='';add('u',v);const w=add('n','…');
+  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json','x-nova-token':TOKEN},body:JSON.stringify({message:v})});
+    const j=await r.json();if(j.error)throw new Error(j.error);w.textContent=j.reply;refreshPending(j.pending);}
+  catch(err){w.textContent='שגיאה: '+err.message;}}
+async function refreshPending(n){ if(n===undefined){try{const r=await fetch('/api/pending',{headers:{'x-nova-token':TOKEN}});n=(await r.json()).length;}catch{n=0;}}
+  $('#pend').textContent=n?('⚠ '+n+' מיילים לאישור'):''; }
+async function showPending(){const r=await fetch('/api/pending',{headers:{'x-nova-token':TOKEN}});const list=await r.json();
+  if(!list.length){alert('אין מיילים ממתינים');return;}
+  for(const p of list){ if(confirm('לשלוח ל-'+p.to+'?\n\n'+p.subject+'\n\n'+p.body)){
+    await fetch('/api/approve',{method:'POST',headers:{'Content-Type':'application/json','x-nova-token':TOKEN},body:JSON.stringify({id:p.id})});}
+    else{ if(confirm('למחוק את הטיוטה?')) await fetch('/api/reject',{method:'POST',headers:{'Content-Type':'application/json','x-nova-token':TOKEN},body:JSON.stringify({id:p.id})});}}
+  refreshPending();}
+if(TOKEN)refreshPending();
+setTimeout(()=>add('n','היי, אני נובה. אני יכולה לחקור, לשלוח לך מיילים באמת, ולתזמן משימות שירוצו לבד. מה נעשה?'),300);
+</script>
+</body>
+</html>

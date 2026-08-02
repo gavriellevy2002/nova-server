@@ -157,7 +157,7 @@ form{position:relative;z-index:2;display:flex;gap:8px;align-items:center;
   <div class="brand">N O V A <i>✦</i></div>
   <div class="hbtns">
     <button class="chip" id="pend" onclick="openPending()"></button>
-    <button class="chip" id="hfBtn" onclick="toggleHF()" title="Hands-free">🔁</button>
+    <button class="chip" id="wakeBtn" onclick="toggleWake()" title="Always listening">👂</button>
     <button class="chip" onclick="openMenu()">☰</button>
   </div>
 </header>
@@ -195,12 +195,11 @@ form{position:relative;z-index:2;display:flex;gap:8px;align-items:center;
 <script>
 'use strict';
 const $ = s => document.querySelector(s);
-const LS = { tok:'nv_tok', voice:'nv_voiceOn', hf:'nv_handsfree' };
+const LS = { tok:'nv_tok', voice:'nv_voiceOn', wake:'nv_wake' };
 const LANG = 'en';
 
 let TOKEN    = localStorage.getItem(LS.tok) || '';
 let VOICE_ON = localStorage.getItem(LS.voice) !== '0';
-let HANDSFREE= localStorage.getItem(LS.hf) === '1';
 let busy = false;
 
 /* ================= state / aura ================= */
@@ -259,7 +258,7 @@ async function send(e) {
   const text = $('#in').value.trim();
   if (!text || busy) return;
   $('#in').value = '';
-  stopMic();
+  pauseRec();          // mic stays shut until she finishes answering
   add('u', text);
   busy = true;
   setState('thinking', 'Nova is thinking…');
@@ -283,6 +282,7 @@ async function send(e) {
     bubble.textContent = 'Error: ' + err.message;
     bubble.classList.add('err');
     setState(null, '');
+    resumeRec();                 // never leave the mic stuck closed after a failure
   } finally {
     busy = false;
     $('#log').scrollTop = 1e9;
@@ -347,9 +347,9 @@ function clean(t) {
 }
 
 function speak(text) {
-  if (!VOICE_ON || !text) { if (HANDSFREE) setTimeout(startMic, 350); return; }
+  if (!VOICE_ON || !text) { resumeRec(); return; }
   const say = clean(text);
-  if (!say) { if (HANDSFREE) setTimeout(startMic, 350); return; }
+  if (!say) { resumeRec(); return; }
   stopAllAudio();
   if (HEALTH.voiceReady && elFails < 2) speakEleven(say);
   else speakBrowser(say);
@@ -378,7 +378,7 @@ async function speakEleven(say) {
     lastBlobUrl = URL.createObjectURL(blob);
 
     player.onplay  = () => setState('speaking', 'Speaking…');
-    player.onended = () => { setState(null,''); if (HANDSFREE) setTimeout(startMic, 300); };
+    player.onended = () => { setState(null,''); resumeRec(); };
     player.onerror = () => { elFails++; speakBrowser(say); };
 
     player.src = lastBlobUrl;
@@ -413,15 +413,15 @@ function speakBrowser(say) {
 
   let started = false;
   u.onstart = () => { started = true; clearTimeout(speakTimer); setState('speaking','Speaking…'); };
-  u.onend   = () => { setState(null,''); if (HANDSFREE) setTimeout(startMic, 300); };
-  u.onerror = () => { setState(null,''); if (HANDSFREE) setTimeout(startMic, 300); };
+  u.onend   = () => { setState(null,''); resumeRec(); };
+  u.onerror = () => { setState(null,''); resumeRec(); };
 
   clearTimeout(speakTimer);
   speakTimer = setTimeout(() => {
     if (!started) {
       setState(null,'');
       offerTapBrowser(say);
-      if (HANDSFREE) setTimeout(startMic, 300);
+      resumeRec();
     }
   }, 1700);
 
@@ -446,67 +446,198 @@ function offerTapBrowser(say) {
   $('#log').scrollTop = 1e9;
 }
 
-/* ================= speech IN ================= */
+/* ================= speech IN =================
+   Two ways to talk to her:
+     • push-to-talk  — tap the mic, speak, it sends when you stop.
+     • always-on 👂  — the mic never closes. She ignores everything until she
+                       hears "Hey Nova", then captures whatever follows.
+   The mic is deliberately closed while she thinks and speaks, otherwise she
+   hears her own voice through the speaker and answers herself. Right after she
+   finishes there is a grace window where you can reply WITHOUT the wake word,
+   so a real back-and-forth doesn't need "Hey Nova" every single turn. */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null, micOn = false, restarts = 0;
+const WAKE_RE  = /\b(?:hey|hi|ok|okay|yo)[,\s]+nova\b|^\s*nova\b/i;
+const GRACE_MS = 12000;   // reply without the wake word for this long after she speaks
+const PAUSE_MS = 1300;    // silence that means "I finished my sentence"
+
+let rec = null;
+let recRunning = false;
+let wakeMode  = localStorage.getItem(LS.wake) === '1';
+let paused    = false;    // true while she is thinking or speaking
+let armed     = false;    // true once the wake word landed (or we're in grace)
+let graceUntil = 0;
+let pauseTimer = null;
+let finalBuf  = '';
+let idleTail  = '';   // rolling tail of ignored speech, for split wake phrases
+let failStreak = 0, lastStart = 0;
 
 function micSupported() { return !!SR; }
 
 function buildRec() {
   const r = new SR();
   r.lang = 'en-US';
-  r.continuous = false;      // iOS ignores true anyway; short bursts are more reliable
+  r.continuous = wakeMode;      // only hold the mic open in always-on mode
   r.interimResults = true;
   r.maxAlternatives = 1;
-
-  r.onstart = () => { micOn = true; restarts = 0; $('#mic').classList.add('on');
-                      setState('listening','Listening…'); };
-
-  r.onresult = ev => {
-    let interim = '', finalText = '';
-    for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const t = ev.results[i][0].transcript;
-      if (ev.results[i].isFinal) finalText += t; else interim += t;
-    }
-    $('#in').value = (finalText || interim).trim();
-  };
-
-  r.onerror = ev => {
-    if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-      stopMic();
-      add('n', 'Microphone permission denied. On iPhone: Settings → Safari → Microphone → Allow.', true);
-    }
-  };
-
-  r.onend = () => {
-    micOn = false;
-    $('#mic').classList.remove('on');
-    const said = $('#in').value.trim();
-    if (said) { setState(null,''); send(new Event('x')); return; }
-    if (HANDSFREE && restarts < 3) { restarts++; try { r.start(); return; } catch (e) {} }
-    setState(null,'');
-  };
+  r.onstart  = () => { recRunning = true; paintMic(); showIdleListening(); };
+  r.onresult = handleResult;
+  r.onerror  = handleError;
+  r.onend    = handleEnd;
   return r;
 }
 
-function startMic() {
-  if (!micSupported() || busy || micOn) return;
+function showIdleListening() {
+  if (paused) return;
+  if (wakeMode && !armed) setState('listening', 'Say "Hey Nova"');
+  else setState('listening', 'Listening…');
+}
+
+function handleResult(ev) {
+  let interim = '', finals = '';
+  for (let i = ev.resultIndex; i < ev.results.length; i++) {
+    const t = ev.results[i][0].transcript;
+    if (ev.results[i].isFinal) finals += t + ' '; else interim += t;
+  }
+  const fresh = (finals + ' ' + interim).replace(/\s+/g, ' ').trim();
+
+  if (!wakeMode) {                       // push-to-talk: every word counts
+    finalBuf += finals;
+    $('#in').value = (finalBuf + interim).trim();
+    return;
+  }
+
+  if (!armed) {
+    if (!fresh) return;
+    if (Date.now() < graceUntil) {
+      armed = true; finalBuf = '';       // mid-conversation, no wake word needed
+    } else {
+      // Look in this utterance first, so a bare "Nova, ..." still counts even
+      // when unrelated chatter came before it. Then look across the boundary,
+      // in case "hey" and "nova" landed in separate result events.
+      let m = WAKE_RE.exec(fresh), src = fresh;
+      if (!m) {
+        const probe = (idleTail + ' ' + fresh).replace(/\s+/g, ' ').trim();
+        m = WAKE_RE.exec(probe); src = probe;
+      }
+      if (!m) { idleTail = fresh.slice(-60); return; }   // rolling window, never grows
+      idleTail = '';
+      armed = true;
+      finalBuf = src.slice(m.index + m[0].length).trim() + ' ';
+      blip();
+      const first = finalBuf.trim();
+      $('#in').value = first;
+      setState('listening', 'Listening…');
+      clearTimeout(pauseTimer);
+      if (first) pauseTimer = setTimeout(submitVoice, PAUSE_MS);
+      return;
+    }
+  }
+
+  finalBuf += finals;
+  const cmd = (finalBuf + interim).trim();
+  $('#in').value = cmd;
+  setState('listening', 'Listening…');
+  clearTimeout(pauseTimer);
+  if (cmd) pauseTimer = setTimeout(submitVoice, PAUSE_MS);
+}
+
+function submitVoice() {
+  const t = $('#in').value.trim();
+  finalBuf = ''; armed = false;
+  if (!t) return;
+  pauseRec();
+  send(new Event('x'));
+}
+
+function handleError(ev) {
+  if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+    wakeMode = false; localStorage.setItem(LS.wake, '0'); paintWake();
+    stopRec();
+    add('n', 'Microphone permission denied. iPhone: Settings → Safari → Microphone → Allow. Mac: click the lock icon in the address bar → Microphone → Allow.', true);
+  }
+  // no-speech / aborted / network all fall through to onend, which restarts
+}
+
+function handleEnd() {
+  recRunning = false;
+  paintMic();
+  clearTimeout(pauseTimer);
+
+  if (!wakeMode) {                        // push-to-talk: send what was captured
+    const said = $('#in').value.trim();
+    finalBuf = '';
+    setState(null, '');
+    if (said) send(new Event('x'));
+    return;
+  }
+
+  if (paused) { setState(null, ''); return; }
+
+  // always-on: browsers close the mic periodically. Just reopen it.
+  const now = Date.now();
+  failStreak = (now - lastStart < 500) ? failStreak + 1 : 0;
+  if (failStreak > 6) {
+    wakeMode = false; localStorage.setItem(LS.wake, '0'); paintWake();
+    setState(null, '');
+    add('n', 'Your browser keeps closing the mic, so I stopped always-on listening. On iPhone this is an Apple limitation — use the mic button there, or run always-on from the Mac. Tap the ear icon to try again.', true);
+    return;
+  }
+  setTimeout(startRec, 250);
+}
+
+function startRec() {
+  if (!micSupported() || recRunning || paused || busy) return;
   unlockAudio();
-  try { speechSynthesis.cancel(); } catch (e) {}
   if (!rec) rec = buildRec();
+  lastStart = Date.now();
   try { rec.start(); }
   catch (e) {
     try { rec.abort(); } catch (e2) {}
     rec = buildRec();
-    try { rec.start(); } catch (e3) { setState(null,''); }
+    try { rec.start(); } catch (e3) { recRunning = false; }
   }
 }
 
-function stopMic() {
-  if (!rec) return;
-  try { rec.stop(); } catch (e) {}
-  micOn = false;
-  $('#mic').classList.remove('on');
+function stopRec() {
+  clearTimeout(pauseTimer);
+  finalBuf = ''; idleTail = ''; armed = false;
+  if (rec) { try { rec.stop(); } catch (e) {} }
+  recRunning = false;
+  paintMic();
+}
+
+/* close the mic while she talks so she cannot hear herself */
+function pauseRec() {
+  paused = true;
+  clearTimeout(pauseTimer);
+  if (rec) { try { rec.stop(); } catch (e) {} }
+  recRunning = false;
+  paintMic();
+}
+
+function resumeRec() {
+  paused = false;
+  finalBuf = ''; idleTail = ''; armed = false;
+  graceUntil = Date.now() + GRACE_MS;   // answer her without saying the wake word
+  if (wakeMode) setTimeout(startRec, 300);
+}
+
+function paintMic() { $('#mic').classList.toggle('on', recRunning); }
+
+/* short chime so you know the wake word registered */
+function blip() {
+  try {
+    const C = window.AudioContext || window.webkitAudioContext;
+    if (!C) return;
+    const ctx = blip.ctx || (blip.ctx = new C());
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = 'sine'; o.frequency.value = 880;
+    g.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.12, ctx.currentTime + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.16);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime + 0.18);
+  } catch (e) {}
 }
 
 function toggleMic() {
@@ -514,20 +645,35 @@ function toggleMic() {
     add('n','This browser does not support speech recognition. Use Safari on iPhone, or Chrome/Safari on Mac.', true);
     return;
   }
-  if (micOn) { stopMic(); setState(null,''); } else { startMic(); }
+  if (wakeMode) {                 // manual arm — skip having to say "Hey Nova"
+    armed = true; finalBuf = '';
+    graceUntil = Date.now() + GRACE_MS;
+    if (!recRunning) startRec(); else setState('listening','Listening…');
+    return;
+  }
+  if (recRunning) { stopRec(); setState(null,''); } else { startRec(); }
 }
 
-/* ================= hands-free ================= */
-function toggleHF() {
-  HANDSFREE = !HANDSFREE;
-  localStorage.setItem(LS.hf, HANDSFREE ? '1' : '0');
-  paintHF();
-  if (HANDSFREE) {
-    add('n','Hands-free is on — I\'ll keep listening after each reply. On iPhone you may still need to tap the mic every few turns.');
-    startMic();
+/* ================= always-on mode ================= */
+function toggleWake() {
+  if (!micSupported()) {
+    add('n','This browser does not support speech recognition. Use Safari on iPhone, or Chrome/Safari on Mac.', true);
+    return;
+  }
+  wakeMode = !wakeMode;
+  localStorage.setItem(LS.wake, wakeMode ? '1' : '0');
+  paintWake();
+  stopRec();
+  rec = null;                     // the continuous flag only applies to a fresh instance
+  if (wakeMode) {
+    add('n','Always-on is live. The mic stays open — just say "Hey Nova" and I wake up. For about 12 seconds after I answer you can keep talking without the wake word.');
+    paused = false;
+    startRec();
+  } else {
+    setState(null,'');
   }
 }
-function paintHF() { $('#hfBtn').classList.toggle('on', HANDSFREE); }
+function paintWake() { $('#wakeBtn').classList.toggle('on', wakeMode); }
 
 /* ================= pending emails ================= */
 async function refreshPending(n) {
@@ -699,6 +845,16 @@ async function openMenu() {
     b.appendChild(tc);
   }
 
+  const lc = document.createElement('div');
+  lc.className = 'card';
+  lc.innerHTML = '<b>Listening</b><div class="muted" style="margin-top:6px">' +
+    '🎙 Mic button — tap, talk, it sends when you stop.<br>' +
+    '👂 Always-on — the mic stays open. Say <b style="color:inherit">"Hey Nova"</b> and I wake up. ' +
+    'For ~12 seconds after I answer you can keep talking without the wake word.<br>' +
+    '<span style="color:var(--dim)">Always-on works best on the Mac. On iPhone, Apple closes the mic on its own, ' +
+    'so it will hand back to the mic button.</span></div>';
+  b.appendChild(lc);
+
   const help = document.createElement('div');
   help.className = 'card';
   help.innerHTML = '<b>Install</b><div class="muted" style="margin-top:6px">' +
@@ -728,14 +884,14 @@ function closeSheet(id) { $('#' + id).classList.remove('show'); }
 
 /* ================= boot ================= */
 async function boot() {
-  paintHF();
+  paintWake();
   refreshPending();
   if (!micSupported()) {
     $('#mic').style.opacity = '.4';
-    $('#hfBtn').style.display = 'none';
+    $('#wakeBtn').style.display = 'none';
   }
   if (!$('#log').children.length) {
-    add('n', "Hey Gavriel. I'm Nova. I can research the web, actually send email, schedule tasks that run on their own, and remember what matters to you. Talk to me, or tap the mic.");
+    add('n', "Hey Gavriel. I'm Nova. I can research the web, actually send email, schedule tasks that run on their own, and remember what matters to you. Tap the mic to talk — or tap the ear icon and I'll stay listening for \"Hey Nova\".");
   }
   try { HEALTH = await (await fetch('/health')).json(); } catch (e) { HEALTH = { voiceReady:false }; }
   if (HEALTH.voice && !HEALTH.voiceReady) {

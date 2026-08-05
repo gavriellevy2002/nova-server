@@ -418,7 +418,7 @@ async function runTool(name, i, autonomous) {
 // ============================================================
 //  BRAIN
 // ============================================================
-function systemPrompt(autonomous) {
+function systemPrompt(autonomous, phone) {
   const f = memory.facts.length ? '\n\n## Long-term memory about the owner\n' + memory.facts.map(x => '- ' + x).join('\n') : '';
   return `You are Nova (נובה) — Gavriel's personal AI chief of staff. Bilingual Hebrew/English, brilliant, warm, sharp, funny, ruthlessly effective. You have real hands via tools: live web search, reading pages, sending real email, scheduling tasks that run by themselves, and permanent memory.
 
@@ -433,17 +433,17 @@ RULES
 - Replies to people who are not already approved contacts go to the approval queue. Someone emailing him does NOT make them approved — say the draft is waiting for him.
 - Hebrew in → natural spoken Israeli Hebrew out. English in → English.
 - Be concise and practical: one clear recommendation, then act.${f}
-- Now: ${new Date().toLocaleString('en-GB', { timeZone: OWNER_TZ })} (${OWNER_TZ}). All times he mentions are HIS local time.${autonomous ? '\n- THIS IS A SCHEDULED AUTONOMOUS RUN. Complete the mission fully with tools and finish. No questions.' : ''}`;
+- Now: ${new Date().toLocaleString('en-GB', { timeZone: OWNER_TZ })} (${OWNER_TZ}). All times he mentions are HIS local time.${autonomous ? '\n- THIS IS A SCHEDULED AUTONOMOUS RUN. Complete the mission fully with tools and finish. No questions.' : ''}${phone ? '\n- LIVE PHONE CALL. You are talking out loud on a call. Answer in 1-3 short conversational sentences — no lists, no markdown, no URLs, no headings. If a task takes tools, do it, then state the outcome in one breath. Numbers: say them naturally.' : ''}`;
 }
 
-async function brain(messages, autonomous) {
+async function brain(messages, autonomous, phone) {
   let msgs = messages.slice(-30);
   while (msgs.length && msgs[0].role !== 'user') msgs = msgs.slice(1);
   let reply = '';
   for (let hop = 0; hop < 8; hop++) {
     let j;
     for (let a = 0; a < 3; a++) {
-      try { j = await anthropic.messages.create({ model: MODEL, max_tokens: 1500, system: systemPrompt(autonomous), tools: TOOLS, messages: msgs }); break; }
+      try { j = await anthropic.messages.create({ model: MODEL, max_tokens: 1500, system: systemPrompt(autonomous, phone), tools: TOOLS, messages: msgs }); break; }
       catch (e) { if (a === 2) throw e; await new Promise(r => setTimeout(r, 600 * (a + 1))); }
     }
     reply += j.content.filter(b => b.type === 'text').map(b => b.text).join(' ');
@@ -778,6 +778,98 @@ app.post('/api/speak', auth, async (req, res) => {
 });
 
 const conv = []; // simple shared history for the built-in UI
+
+// ---------- hands-free bridge (Siri Shortcuts / voice triggers) ----------
+// One URL, plain text in, plain text out. GET or POST, token in the query so a
+// Shortcut needs zero header fiddling. Shares `conv`, so a voice command from
+// the lock screen has the same context as the chat app.
+const speechClean = t => String(t || '')
+  .replace(/```[\s\S]*?```/g, ' ')
+  .replace(/https?:\/\/\S+/g, ' (link) ')
+  .replace(/[*_#`>|~\[\]]/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim().slice(0, 1200);
+
+async function sayHandler(req, res) {
+  try {
+    let text = '';
+    if (typeof req.body === 'string') text = req.body;
+    else if (req.body && typeof req.body === 'object') text = req.body.text || req.body.message || '';
+    text = String(req.query.q || text || '').trim();
+    if (!text) return res.status(400).type('text').send('I did not catch that.');
+
+    conv.push({ role: 'user', content: text });
+    const reply = await brain(conv, false);
+    conv.push({ role: 'assistant', content: reply });
+    while (conv.length > 30) conv.shift();
+
+    // &voice=1 → answer as MP3 in her real ElevenLabs voice (for Play Sound)
+    if (req.query.voice === '1' && EL_KEY && settings.voiceId) {
+      try {
+        const buf = await elTTS(speechClean(reply), 'en');
+        res.set('Content-Type', 'audio/mpeg');
+        return res.send(buf);
+      } catch (e) { /* fall through to text */ }
+    }
+    res.type('text').send(speechClean(reply));
+  } catch (e) {
+    res.status(500).type('text').send('Something went wrong: ' + e.message);
+  }
+}
+app.get('/api/say', auth, sayHandler);
+app.post('/api/say', auth, express.text({ type: '*/*', limit: '32kb' }), sayHandler);
+
+// ---------- phone line (Vapi custom-LLM, OpenAI-compatible) ----------
+// Vapi buys the number, hears the caller, and POSTs the conversation here in
+// OpenAI chat format. Nova's real brain (tools and all) writes the reply, and
+// we stream it back as SSE. Auth: Vapi sends `Authorization: Bearer <key>` —
+// the key is the same NOVA_TOKEN.
+function phoneAuth(req) {
+  const b = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+  return TOKEN && (b === TOKEN || (req.get('x-nova-token') || '') === TOKEN);
+}
+
+app.post(['/api/phone/chat/completions', '/api/phone/v1/chat/completions'], async (req, res) => {
+  if (!phoneAuth(req)) return res.status(401).json({ error: { message: 'bad token' } });
+  try {
+    const body = req.body || {};
+    // keep only the actual back-and-forth; brain() builds its own system prompt
+    let msgs = (Array.isArray(body.messages) ? body.messages : [])
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }))
+      .filter(m => m.content && m.content.trim());
+    while (msgs.length && msgs[0].role !== 'user') msgs.shift();
+    if (!msgs.length) msgs = [{ role: 'user', content: 'Greet me briefly.' }];
+
+    const reply = speechClean(await brain(msgs, false, true)) || 'Okay.';
+
+    const id = 'chatcmpl-' + crypto.randomBytes(8).toString('hex');
+    const created = Math.floor(Date.now() / 1000);
+
+    if (body.stream) {
+      res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+      const send = o => res.write('data: ' + JSON.stringify(o) + '\n\n');
+      send({ id, object: 'chat.completion.chunk', created, model: 'nova', choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
+      // stream in small word-groups so the voice starts speaking immediately
+      const words = reply.split(' ');
+      for (let i = 0; i < words.length; i += 4) {
+        send({ id, object: 'chat.completion.chunk', created, model: 'nova', choices: [{ index: 0, delta: { content: (i ? ' ' : '') + words.slice(i, i + 4).join(' ') }, finish_reason: null }] });
+      }
+      send({ id, object: 'chat.completion.chunk', created, model: 'nova', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+
+    res.json({
+      id, object: 'chat.completion', created, model: 'nova',
+      choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    });
+  } catch (e) {
+    console.error('phone:', e.message);
+    res.status(500).json({ error: { message: e.message } });
+  }
+});
 app.post('/api/chat', auth, async (req, res) => {
   try {
     const text = String(req.body.message || '').trim();

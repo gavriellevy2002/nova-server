@@ -826,10 +826,12 @@ app.post('/api/say', auth, express.text({ type: '*/*', limit: '32kb' }), sayHand
 // the key is the same NOVA_TOKEN.
 function phoneAuth(req) {
   const b = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
-  return TOKEN && (b === TOKEN || (req.get('x-nova-token') || '') === TOKEN);
+  return TOKEN && (b === TOKEN || (req.get('x-nova-token') || '') === TOKEN
+    || (req.params && req.params.key === TOKEN));   // key may ride in the URL path
 }
 
-app.post(['/api/phone/chat/completions', '/api/phone/v1/chat/completions'], async (req, res) => {
+app.post(['/api/phone/chat/completions', '/api/phone/v1/chat/completions',
+          '/api/phone/:key/chat/completions', '/api/phone/:key/v1/chat/completions'], async (req, res) => {
   if (!phoneAuth(req)) return res.status(401).json({ error: { message: 'bad token' } });
   try {
     const body = req.body || {};

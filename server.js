@@ -273,11 +273,14 @@ async function ytSearch(q) {
   const searchUrl = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query) + '&hl=en&gl=US';
   const tries = [
     searchUrl,
-    'https://m.youtube.com/results?search_query=' + encodeURIComponent(query) + '&hl=en&gl=US'
+    'https://m.youtube.com/results?search_query=' + encodeURIComponent(query) + '&hl=en&gl=US',
+    // proxy fallback: the jina reader fetches from ITS servers, so even if
+    // YouTube blocks Render's IP entirely we still get the results page
+    'https://r.jina.ai/' + searchUrl
   ];
   for (const url of tries) {
     try {
-      const r = await fetchT(url, { headers: YT_HEADERS }, 12000);
+      const r = await fetchT(url, { headers: YT_HEADERS }, 14000);
       if (!r.ok) continue;
       const html = await r.text();
       const videoId = firstVideoId(html);
@@ -504,12 +507,13 @@ function systemPrompt(autonomous, phone) {
   return `You are Nova (נובה) — Gavriel's personal AI chief of staff. Bilingual Hebrew/English, brilliant, warm, sharp, funny, ruthlessly effective. You have real hands via tools: live web search, reading pages, sending real email, scheduling tasks that run by themselves, and permanent memory.
 
 RULES
-- Actually DO things with tools instead of describing them. If he asks for research and to email it — search, read, compile, and send_email. Don't ask permission for safe actions.
+- Actually DO things with tools instead of describing them. NEVER end with 'here is a link, open/paste it yourself' — if one tool fails, complete the job with another tool. A raw URL pasted into chat is a failure state.
+- If a tool errors, do not narrate the error to him or blame a 'connection issue'. Route around it silently and deliver the result. If he asks for research and to email it — search, read, compile, and send_email. Don't ask permission for safe actions.
 - Money & safety: never spend money, never touch banking, never buy. Those are off-limits, full stop.
 - Email: to himself or known contacts sends immediately. To NEW people: ${settings.autoSend ? 'AUTOPILOT IS ON — send immediately, a copy is BCCed to him automatically.' : 'goes to his approval queue — tell him it is waiting.'}
 - Use remember generously for his life and business (anniversaries, his wife's taste, contacts, preferences, recurring errands).
 - INBOX: you can read his email. list_inbox for what arrived, read_email for the full text, search_inbox to find something, reply_email to answer. When he asks what's new, list unread, read the ones that actually matter, and give him a short triage: what needs him today, what can wait, what is noise. Never claim an email exists without reading it.
-- MUSIC & VIDEO: when he asks to play/hear/watch something, call play_media with a good search query (song + artist). In the app it becomes a one-tap player card. On a phone call, audio cannot play into the line — do it anyway and tell him it is waiting on his screen.
+- MUSIC & VIDEO — HARD RULE: any request to play/hear/watch anything, even phrased as 'open YouTube and play X', means ONE thing: call play_media immediately. No clarifying questions. NEVER browse_open for YouTube. NEVER paste a raw link and tell him to open it himself — the app turns play_media into a player that starts on its own. If play_media returns only a search link, it still becomes a tappable card in his app, so use it anyway and say the card is on his screen.
 - BROWSER: browse_open gives you a real Chromium. Use it when a page needs JavaScript or when you must interact; use read_page for plain reading, it is faster and cheaper. After opening you get numbered elements — click and type by number. Sessions are short, so act decisively: open, read, do the thing, browse_close.
 - Browser limits are hard, not negotiable: banking, brokerage and payment sites are blocked outright; buy/pay/checkout/delete-account buttons are refused; password, card and secret fields are refused. If a task needs one of those, do everything up to that point and hand it to him with the exact link and what to press. Never present a refusal as a failure — it is the design.
 - Replies to people who are not already approved contacts go to the approval queue. Someone emailing him does NOT make them approved — say the draft is waiting for him.
@@ -593,7 +597,7 @@ async function ensureSession() {
     browser = /playwright/i.test(BROWSER_WS)
       ? await chromium.connect(BROWSER_WS, { timeout: 25000 })
       : await chromium.connectOverCDP(BROWSER_WS, { timeout: 25000 });
-  } catch (e) { throw new Error('could not reach the cloud browser: ' + e.message); }
+  } catch (e) { throw new Error('cloud browser is unreachable. Do NOT hand the owner a link or mention connection issues — finish the task with other tools instead: play_media for music/video, read_page + web_search for sites.'); }
 
   const ctx = browser.contexts()[0] || await browser.newContext({
     viewport: { width: 1280, height: 900 },
@@ -652,6 +656,9 @@ async function pageState(s, note) {
 async function browseOpen(url) {
   let u = String(url || '').trim();
   if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+  if (/(^|\.)youtube\.com$|(^|\.)youtu\.be$|(^|\.)music\.youtube\.com$/.test(hostOf(u))) {
+    throw new Error('For YouTube use play_media — it plays directly in his app. Do not browse there.');
+  }
   if (blockedUrl(u)) throw new Error('Refused: ' + hostOf(u) + ' is a banking/payment site. I never touch those.');
   const s = await ensureSession();
   await s.page.goto(u, { waitUntil: 'domcontentloaded', timeout: 25000 });

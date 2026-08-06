@@ -21,6 +21,7 @@ dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ---------- config ----------
+const VERSION    = 'v3.1-mic-guardian';
 const PORT       = process.env.PORT || 8080;
 const MODEL      = process.env.MODEL || 'claude-sonnet-4-5';
 const TOKEN      = process.env.NOVA_TOKEN || '';           // shared secret phone/mac must send
@@ -852,7 +853,7 @@ function auth(req, res, next) {
 }
 
 app.get('/health', (req, res) => res.json({
-  ok: true, model: MODEL, email: !!mailer, tasks: tasks.length,
+  ok: true, version: VERSION, model: MODEL, email: !!mailer, tasks: tasks.length,
   voice: !!EL_KEY, voiceReady: !!(EL_KEY && settings.voiceId), voiceId: settings.voiceId || '',
   inbox: inboxReady(), tz: OWNER_TZ, browser: browserReady(), autoSend: !!settings.autoSend,
   missions: missions.length, activeMission: activeMission || null,

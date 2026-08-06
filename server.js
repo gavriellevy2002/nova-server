@@ -423,6 +423,9 @@ const TOOLS = [
   { name: 'list_inbox', description: "List recent emails in the owner's inbox (newest first). Returns uid, from, subject, date, unread. Use unread_only for 'what's new', then read_email for the ones that matter.", input_schema: { type: 'object', properties: { limit: { type: 'number' }, unread_only: { type: 'boolean' }, days: { type: 'number' } } } },
   { name: 'read_email', description: 'Read one full email by its uid (from list_inbox or search_inbox). Reading does NOT mark it read in Gmail.', input_schema: { type: 'object', properties: { uid: { type: 'number' } }, required: ['uid'] } },
   { name: 'search_inbox', description: 'Search the inbox by sender, subject or body text.', input_schema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number' } }, required: ['query'] } },
+  { name: 'start_mission', description: "Launch a mission across the owner's agent map — his visual company of 159 AI agents in 10 departments. Use when he asks to run something 'on the map' or as 'a mission'. Runs in the background; agents light up on the map as work happens. One mission at a time.", input_schema: { type: 'object', properties: { goal: { type: 'string' } }, required: ['goal'] } },
+  { name: 'list_missions', description: "List recent missions run on the agent map, with status (queued/running/done/failed) and how many agents worked.", input_schema: { type: 'object', properties: {} } },
+  { name: 'get_mission', description: "Full detail of one map mission: every agent that worked, what each produced, and the final result. Omit id for the most recent mission.", input_schema: { type: 'object', properties: { id: { type: 'string' } } } },
   { name: 'play_media', description: "Find a song or video on YouTube for the owner. The app shows the result as a tappable player card that starts playing. Use whenever he asks to play/hear/watch something. On a PHONE CALL you cannot play audio into the line — tell him the card is waiting in the app.", input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
   { name: 'log_work', description: "During a mission, record one real piece of work against the agent on the map whose job it was. Use the exact agent name from the roster in the mission brief. This is what makes the map light up.", input_schema: { type: 'object', properties: { agent: { type: 'string' }, department: { type: 'string' }, summary: { type: 'string' }, output: { type: 'string' } }, required: ['agent', 'summary'] } },
   { name: 'browse_open', description: "Open a real browser on a URL and read it. Returns the page text plus a numbered list of clickable elements. Use this when a site needs JavaScript, a login-free form, or interaction that read_page cannot do.", input_schema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } },
@@ -466,6 +469,28 @@ async function runTool(name, i, autonomous) {
     }
     if (name === 'read_email') return JSON.stringify(await readEmail(i.uid));
 
+    if (name === 'start_mission') {
+      if (activeMission) return 'Mission #' + activeMission + ' is still running — one at a time. Check it with get_mission first.';
+      const m = newMission(String(i.goal || '').trim() || 'Unnamed mission');
+      missionQueue = missionQueue.then(() => runMission(m)).catch(() => {});
+      return 'Mission #' + m.id + ' is launching across the map: "' + m.goal + '". Agents will light up as they work — he can watch on the 🗺 map, or just ask me for a status update.';
+    }
+    if (name === 'list_missions') {
+      if (!missions.length) return 'No missions have been run on the map yet. Offer to start one with start_mission.';
+      return JSON.stringify(missions.slice(-10).reverse().map(m => ({
+        id: m.id, goal: m.goal, status: m.status, agents_worked: m.steps.length,
+        started: new Date(m.started).toLocaleString('en-GB', { timeZone: OWNER_TZ })
+      })));
+    }
+    if (name === 'get_mission') {
+      const m = (i.id ? missions.find(x => x.id === i.id) : missions[missions.length - 1]);
+      if (!m) return 'No missions yet.';
+      return JSON.stringify({
+        id: m.id, goal: m.goal, status: m.status,
+        result: (m.result || '').slice(0, 900),
+        agents: m.steps.map(st => ({ agent: st.agent, dept: st.dept, did: st.summary, found: (st.output || '').slice(0, 250) }))
+      });
+    }
     if (name === 'play_media') {
       const m = await ytSearch(i.query);
       lastMedia = m;
@@ -513,6 +538,7 @@ RULES
 - Email: to himself or known contacts sends immediately. To NEW people: ${settings.autoSend ? 'AUTOPILOT IS ON — send immediately, a copy is BCCed to him automatically.' : 'goes to his approval queue — tell him it is waiting.'}
 - Use remember generously for his life and business (anniversaries, his wife's taste, contacts, preferences, recurring errands).
 - INBOX: you can read his email. list_inbox for what arrived, read_email for the full text, search_inbox to find something, reply_email to answer. When he asks what's new, list unread, read the ones that actually matter, and give him a short triage: what needs him today, what can wait, what is noise. Never claim an email exists without reading it.
+- THE AGENT MAP: Gavriel built a live visual map of his AI company — 159 specialist agents in 10 departments (SALES, MARKETING, INTELLIGENCE, ACQUISITIONS, COMMAND...). It opens via the map button in this app. Missions run across it and the agents that work light up gold. When he says "the map", "the agents", "my company", "המפה", "הסוכנים" — THIS is what he means; never say you don't know it. Tools: start_mission launches work on it, list_missions shows recent runs, get_mission gives the full story of one (who worked, what they found). Report from these in plain words.
 - MUSIC & VIDEO — HARD RULE: any request to play/hear/watch anything, even phrased as 'open YouTube and play X', means ONE thing: call play_media immediately. No clarifying questions. NEVER browse_open for YouTube. NEVER paste a raw link and tell him to open it himself — the app turns play_media into a player that starts on its own. If play_media returns only a search link, it still becomes a tappable card in his app, so use it anyway and say the card is on his screen.
 - BROWSER: browse_open gives you a real Chromium. Use it when a page needs JavaScript or when you must interact; use read_page for plain reading, it is faster and cheaper. After opening you get numbered elements — click and type by number. Sessions are short, so act decisively: open, read, do the thing, browse_close.
 - Browser limits are hard, not negotiable: banking, brokerage and payment sites are blocked outright; buy/pay/checkout/delete-account buttons are refused; password, card and secret fields are refused. If a task needs one of those, do everything up to that point and hand it to him with the exact link and what to press. Never present a refusal as a failure — it is the design.

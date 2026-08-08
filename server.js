@@ -49,6 +49,7 @@ const EL_MODEL_HE = process.env.ELEVEN_MODEL_HE || 'eleven_v3';
 const EL_MODEL_EN = process.env.ELEVEN_MODEL_EN || 'eleven_flash_v2_5';
 const EL_FALLBACK = 'eleven_multilingual_v2';
 const EL_MAX_CHARS = Number(process.env.ELEVEN_MAX_CHARS || 1200);   // cost guard
+const WORKLOG_MAX  = Number(process.env.WORKLOG_MAX || 12000);       // how much of each agent's work is kept
 
 if (!process.env.ANTHROPIC_API_KEY) console.error('\n⚠️  missing ANTHROPIC_API_KEY\n');
 if (!TOKEN) console.error('\n⚠️  missing NOVA_TOKEN — anyone could use this server. Set one.\n');
@@ -349,9 +350,238 @@ function logWork(agent, dept, summary, output) {
   const m = missions.find(x => x.id === activeMission);
   if (!m) return 'No mission is running, so there was nothing to log against.';
   m.steps.push({ agent, dept: dept || '', summary: summary || '',
-                 output: (output || '').slice(0, 1200), ts: Date.now() });
+                 output: (output || '').slice(0, WORKLOG_MAX), ts: Date.now() });
   saveMissions();
   return 'Logged to ' + agent + ' (step ' + m.steps.length + ').';
+}
+
+// ── Acquisition underwriting: doctrine + calculator ──────────────────────────
+const ACQ_DOCTRINE = `
+## BUYING BUSINESSES — Gavriel's acquisition doctrine (you know this cold)
+He is actively trying to buy a boomer-owned US small business with little cash down.
+NEVER hand him a deal you have not scored. Call score_deal BEFORE you email him about any
+specific business, and put its numbers in the email. Numbers, not vibes.
+
+HARD RULES — never negotiable:
+- Gavriel is a GREEN CARD HOLDER. SBA 7(a) and 504 are CLOSED to him. SBA Policy Notice
+  5000-876441 (issued 2 Feb 2026, effective 1 Mar 2026, updating SOP 50 10 8) requires 100%
+  of direct AND indirect owners to be US citizens or nationals; even a 1% LPR stake
+  disqualifies the business, and lenders certify it in E-Tran. Never propose an SBA deal.
+- NEVER suggest putting a deal in a citizen's name while he controls it. That is a
+  straw-buyer structure: 18 U.S.C. 1014 (up to 30 years plus mandatory forfeiture), 18
+  U.S.C. 1001, 15 U.S.C. 645, False Claims Act treble damages — and for a permanent
+  resident a fraud conviction risks the green card itself. A genuine citizen partner with
+  real capital at risk, real equity and real control is legal; a nominee is not. The
+  difference is whether the paperwork describes reality. If he drifts toward this, stop him.
+- "Buy it for the cost of a meal" is not real and you must say so. Even zero-down and fully
+  seller-financed he needs roughly 25k-50k liquid (legal 8-20k, accounting 2.5-7.5k,
+  liens/entity/licensing 1.5-3k, working capital 5-10% of price) plus about 6 months of
+  living reserve. Repeat it plainly every time. Anyone offering a cash-flowing business for
+  nothing is selling a scam, a corpse, or a crime.
+
+THE PLAY THAT ACTUALLY WORKS FOR HIM:
+Boring, recurring-revenue, non-owner-dependent service business or route, 150k-300k, within
+75 miles of Jackson NJ, owner 62+, bought with about 10% down plus a 90% seller note at 7-8%
+over 7 years, with roughly 20% of price behind a 12-month performance earn-out. The March
+2026 SBA rule is the #1 transactional bottleneck in the market (BizBuySell Q2 2026): volume
+down 10% YoY while buyer demand is up, so sellers are stuck with dead SBA buyers. "I don't
+need a bank, I need YOU to be the bank" is the strongest sentence in the market right now.
+Route businesses (bread, vending, linen) often carry manufacturer financing — private, not
+SBA, so no citizenship test applies.
+
+BENCHMARKS YOU UNDERWRITE AGAINST (2026):
+- Market average 2.7x SDE and 0.70x revenue; median sale price 349,250 (BizBuySell Q2 2026).
+- HVAC 2.79x, plumbing 2.51x, trades 2.62x, laundromats 3.65-4.12x, waste 3.20x, medical
+  billing 4.41x. Restaurants 2.15x and coffee shops 2.21x are cheap because they are bad.
+- DSCR floor 1.25x; below 1.0 the business cannot pay its own debt. Always underwrite at 80%
+  of claimed SDE, because sellers overstate.
+- Seller notes 5-8%, 3-7 years, often a balloon at year 5, secured by UCC-1 with a personal
+  guarantee. Must meet the IRS AFR or interest is imputed. IRC 453 installment treatment
+  spreads the seller's capital gains over years — that is HIS incentive; use it as the pitch.
+- Customer concentration: over 15% start worrying, over 20% is the most common red flag,
+  over 30% walk away.
+- Working capital 5-10% of price. A full quality-of-earnings report (15-50k) is overkill
+  under 1M — use a 2.5-7.5k accountant review instead.
+- ASSET purchase, never stock purchase — he assumes only the liabilities he names.
+- LOI exclusivity 30-90 days; confidentiality and exclusivity bind even though the rest does not.
+- Non-compete 3-5 years with a defined radius, written into the APA.
+- Verify SDE against 24 months of BANK STATEMENTS and IRS Form 4506-C transcripts. The P&L is
+  an opinion; the bank statement is a fact.
+
+He has a live Excel model at ~/Documents/Acquisitions/Deal-Analyzer.xlsx running this exact
+math (tabs: Input, SDE, Valuation, Financing, Amort, Stress, Scorecard, CashToClose,
+Diligence, Reference). score_deal returns the same numbers, so your answer and his
+spreadsheet always agree. Tell him which tab to open when he wants to go deeper.`;
+
+function pmtMonthly(principal, annualRate, years) {
+  const r = Number(annualRate) / 12, n = Number(years) * 12;
+  if (!(principal > 0) || !(n > 0)) return 0;
+  if (r === 0) return principal / n;
+  return principal * r / (1 - Math.pow(1 + r, -n));
+}
+
+// Mirrors Deal-Analyzer.xlsx exactly. Change one, change the other.
+function scoreDeal(d) {
+  d = d || {};
+  const num = v => (Number(v) || 0);
+  const pct = (v, dflt) => {
+    if (v === undefined || v === null || v === '') return dflt;
+    const x = Number(v);
+    if (isNaN(x)) return dflt;
+    return x > 1 ? x / 100 : x;
+  };
+  const money = v => (v < 0 ? '-' : '') + '$' + Math.abs(Math.round(v)).toLocaleString('en-US');
+  const px = v => (v * 100).toFixed(1) + '%';
+  const mx = v => v.toFixed(2) + 'x';
+
+  const asking  = num(d.asking_price);
+  const price   = num(d.price) || asking;
+  const revenue = num(d.revenue);
+
+  // SDE — use it if given, else build it from the tax-return parts
+  const built = num(d.net_income) + num(d.owner_comp) + num(d.owner_benefits) + num(d.interest)
+              + num(d.depreciation) + num(d.one_time) + num(d.personal_expenses)
+              + num(d.rent_adjustment) - num(d.added_costs);
+  const sde = num(d.sde) || built;
+
+  if (!price || !sde) {
+    return 'score_deal needs at least a price and either sde, or the tax-return parts '
+         + '(net_income, owner_comp, owner_benefits, interest, depreciation, one_time, '
+         + 'personal_expenses). Ask him for the numbers rather than guessing them.';
+  }
+
+  const downP  = pct(d.down_pct, 0.10);
+  const noteP  = pct(d.seller_note_pct, 0.70);
+  const bankP  = pct(d.bank_pct, 0.00);
+  const earnP  = pct(d.earnout_pct, Math.max(0, 1 - downP - noteP - bankP));
+  const nRate  = pct(d.note_rate, 0.08);
+  const nYears = num(d.note_years) || 7;
+  const bRate  = pct(d.bank_rate, 0.115);
+  const bYears = num(d.bank_years) || 5;
+
+  const down = price * downP, note = price * noteP, bank = price * bankP, earn = price * earnP;
+  const stackOff = Math.abs(downP + noteP + bankP + earnP - 1) > 0.005;
+
+  const mNote = pmtMonthly(note, nRate, nYears);
+  const mBank = pmtMonthly(bank, bRate, bYears);
+  const annualDS = (mNote + mBank) * 12;
+  const dscr = annualDS > 0 ? sde / annualDS : Infinity;
+  const dscr80 = annualDS > 0 ? (sde * 0.8) / annualDS : Infinity;
+  const dscr70 = annualDS > 0 ? (sde * 0.7) / annualDS : Infinity;
+  const afterDebt = sde - annualDS;
+  const needIncome = num(d.required_income) || 60000;
+
+  const legal = num(d.legal) || 14000;
+  const acct  = num(d.accounting) || 5000;
+  const other = num(d.other_closing) || 2500;
+  const wc    = price * pct(d.wc_pct, 0.08);
+  const cashClose = down + legal + acct + other + wc;
+  const reserve = num(d.living_reserve) || 30000;
+  const totalCash = cashClose + reserve;
+  const avail = num(d.available_cash);
+  const gap = avail ? avail - totalCash : null;
+  const coc = cashClose > 0 ? afterDebt / cashClose : 0;
+
+  const mult = sde > 0 ? price / sde : 0;
+  const askMult = (asking && sde > 0) ? asking / sde : 0;
+  const revMult = revenue > 0 ? price / revenue : 0;
+  const softAdd = revenue > 0 ? (num(d.one_time) + num(d.personal_expenses)) / revenue : 0;
+
+  // ── scorecard, same tests as the workbook ──
+  const rows = [];
+  const test = (label, value, verdict, why) => rows.push({ label, value, verdict, why });
+  const band = (v, pass, thin, invert) => invert
+    ? (v <= pass ? 'PASS' : v <= thin ? 'THIN' : 'FAIL')
+    : (v >= pass ? 'PASS' : v >= thin ? 'THIN' : 'FAIL');
+
+  test('DSCR at face value', mx(dscr), band(dscr, 1.5, 1.25),
+       'Below 1.25x one bad quarter takes the business.');
+  test('DSCR at 80% of claimed SDE', mx(dscr80), band(dscr80, 1.25, 1.0),
+       'Sellers overstate. This is the real test.');
+  if (d.top_customer_pct !== undefined)
+    test('Largest customer share', px(pct(d.top_customer_pct, 0)),
+         band(pct(d.top_customer_pct, 0), 0.2, 0.3, true),
+         'Over 30% and one phone call ends the business.');
+  if (d.top3_pct !== undefined)
+    test('Top 3 customer share', px(pct(d.top3_pct, 0)),
+         band(pct(d.top3_pct, 0), 0.4, 0.5, true), 'Concentration is the #1 red flag.');
+  test('Multiple paid', mx(mult), band(mult, 3, 4, true),
+       'Market average is 2.7x. Above 4x needs a reason.');
+  if (revenue > 0 && (d.one_time !== undefined || d.personal_expenses !== undefined))
+    test('Soft add-backs vs revenue', px(softAdd), band(softAdd, 0.1, 0.15, true),
+         'Inflated add-backs are how buyers get robbed.');
+  if (d.revenue_trend !== undefined)
+    test('Revenue trend (3yr)', px(pct(d.revenue_trend, 0)),
+         band(pct(d.revenue_trend, 0), 0, -0.1), 'Declining revenue needs a believable answer.');
+  if (d.lease_years !== undefined)
+    test('Lease years remaining', String(num(d.lease_years)), band(num(d.lease_years), 5, 3),
+         'For a location business the lease IS the business.');
+  if (d.owner_hours !== undefined)
+    test('Owner hours/week', String(num(d.owner_hours)), band(num(d.owner_hours), 40, 50, true),
+         'Over 50 he is buying a job, not an asset.');
+  if (d.years_in_business !== undefined)
+    test('Years in business', String(num(d.years_in_business)),
+         band(num(d.years_in_business), 10, 5), 'Survived a recession = real demand.');
+  if (avail)
+    test('Cash to close vs cash he has', money(gap), gap < 0 ? 'FAIL' : gap < 20000 ? 'THIN' : 'PASS',
+         'Running out of money after closing is the classic death.');
+  test('Can still pay himself', money(afterDebt - needIncome),
+       (afterDebt - needIncome) < 0 ? 'FAIL' : (afterDebt - needIncome) < 10000 ? 'THIN' : 'PASS',
+       'If it cannot pay him it is a hobby with debt.');
+
+  const fails = rows.filter(r => r.verdict === 'FAIL').length;
+  const thins = rows.filter(r => r.verdict === 'THIN').length;
+  const overall = fails > 0
+    ? 'WALK AWAY — ' + fails + ' hard fail(s). Do not negotiate around a FAIL.'
+    : thins >= 3
+      ? 'PROCEED WITH CAUTION — ' + thins + ' thin areas. Fix them in price or terms.'
+      : 'WORTH PURSUING — no hard fails. Verify everything, then move fast.';
+
+  const L = [];
+  L.push('DEAL SCORE — ' + (d.name || 'unnamed') + (d.location ? ' (' + d.location + ')' : ''));
+  L.push('');
+  L.push('THE NUMBERS');
+  L.push('  Verified SDE            ' + money(sde) + (num(d.sde) ? '  (given)' : '  (built from the parts)'));
+  if (revenue) L.push('  Revenue                 ' + money(revenue) + '   SDE margin ' + px(sde / revenue));
+  if (asking)  L.push('  Asking price            ' + money(asking) + '   = ' + mx(askMult));
+  L.push('  Offer price             ' + money(price) + '   = ' + mx(mult) + (revMult ? '  /  ' + mx(revMult) + ' revenue' : ''));
+  L.push('  Fair value at 2.5x      ' + money(sde * 2.5));
+  L.push('');
+  L.push('STRUCTURE');
+  L.push('  Down ' + px(downP) + ' = ' + money(down) + '   Seller note ' + px(noteP) + ' = ' + money(note)
+         + (bank ? '   Bank ' + px(bankP) + ' = ' + money(bank) : '') + '   Earn-out ' + px(earnP) + ' = ' + money(earn));
+  if (stackOff) L.push('  !! percentages total ' + px(downP + noteP + bankP + earnP) + ' — they must total 100%');
+  L.push('  Seller note ' + px(nRate) + ' over ' + nYears + ' yrs  ->  ' + money(mNote) + '/mo');
+  if (bank) L.push('  Bank debt  ' + px(bRate) + ' over ' + bYears + ' yrs  ->  ' + money(mBank) + '/mo');
+  L.push('  Annual debt service     ' + money(annualDS) + '   (' + px(annualDS / sde) + ' of SDE)');
+  L.push('');
+  L.push('CAN IT CARRY ITSELF');
+  L.push('  DSCR                    ' + mx(dscr) + '   floor is 1.25x');
+  L.push('  DSCR at 80% of SDE      ' + mx(dscr80) + '   <-- underwrite to THIS');
+  L.push('  DSCR at 70% of SDE      ' + mx(dscr70));
+  L.push('  Cash flow after debt    ' + money(afterDebt));
+  L.push('  After paying himself    ' + money(afterDebt - needIncome));
+  L.push('');
+  L.push('CASH HE ACTUALLY NEEDS');
+  L.push('  Down payment            ' + money(down));
+  L.push('  Legal / accounting / filings  ' + money(legal + acct + other));
+  L.push('  Working capital         ' + money(wc));
+  L.push('  CASH AT CLOSE           ' + money(cashClose));
+  L.push('  + living reserve        ' + money(reserve));
+  L.push('  TOTAL NEEDED            ' + money(totalCash));
+  if (avail) L.push('  He has ' + money(avail) + '  ->  ' + (gap >= 0 ? 'FUNDED, ' + money(gap) + ' spare' : 'SHORT ' + money(-gap)));
+  L.push('  Cash-on-cash return     ' + px(coc) + (coc > 0 ? '   (' + (cashClose / afterDebt).toFixed(1) + ' yrs to recover)' : ''));
+  L.push('');
+  L.push('SCORECARD');
+  rows.forEach(r => L.push('  [' + r.verdict + '] ' + r.label + ': ' + r.value
+                           + (r.verdict === 'PASS' ? '' : '  — ' + r.why)));
+  L.push('');
+  L.push('VERDICT: ' + overall);
+  L.push('');
+  L.push('Reminders: verify SDE against 24 months of bank statements and 4506-C transcripts. '
+       + 'Asset purchase, not stock. No SBA — he is a green card holder. '
+       + 'Full detail in ~/Documents/Acquisitions/Deal-Analyzer.xlsx.');
+  return L.join('\n');
 }
 
 function missionBrief(goal) {
@@ -366,6 +596,10 @@ one entry per real piece of work, with the actual finding in \`output\`, not a p
 
 Agents available:
 ${ROSTER_FLAT.join(', ')}
+
+${ACQ_DOCTRINE}
+
+If this mission touches a specific business for sale, you MUST call score_deal on it before reporting, and include its output verbatim in the email. Never send him a deal you have not scored.
 
 Your LAST action must be send_email to the owner with the full report (findings, numbers, links, next steps). Then finish with a two-line spoken-style summary.`;
 }
@@ -459,11 +693,13 @@ const TOOLS = [
   { name: 'browse_click', description: "Click element number `ref` from the last browse result. Purchases, payments and destructive actions are refused by design.", input_schema: { type: 'object', properties: { ref: { type: 'number' } }, required: ['ref'] } },
   { name: 'browse_type', description: "Type into element number `ref`. Set submit:true to press Enter after. Password/card/secret fields are refused.", input_schema: { type: 'object', properties: { ref: { type: 'number' }, text: { type: 'string' }, submit: { type: 'boolean' } }, required: ['ref', 'text'] } },
   { name: 'browse_close', description: 'Close the browser session when finished.', input_schema: { type: 'object', properties: {} } },
+  { name: 'score_deal', description: "Underwrite a business acquisition. ALWAYS call this before telling Gavriel about a specific business for sale, and put the result in the email. Give it whatever numbers you have: price/asking_price plus either sde, or the tax-return parts (net_income, owner_comp, owner_benefits, interest, depreciation, one_time, personal_expenses, rent_adjustment, added_costs). Optional structure: down_pct, seller_note_pct, bank_pct, earnout_pct, note_rate, note_years. Optional risk facts (they add scorecard tests): top_customer_pct, top3_pct, revenue_trend, lease_years, owner_hours, years_in_business, available_cash. Percentages accept either 0.1 or 10. Returns SDE, multiples, DSCR (including stressed at 80% and 70% of claimed SDE), cash actually needed to close, and a PASS/THIN/FAIL scorecard with a walk-or-pursue verdict.", input_schema: { type: 'object', properties: { name: { type: 'string' }, location: { type: 'string' }, asking_price: { type: 'number' }, price: { type: 'number' }, revenue: { type: 'number' }, sde: { type: 'number' }, net_income: { type: 'number' }, owner_comp: { type: 'number' }, owner_benefits: { type: 'number' }, interest: { type: 'number' }, depreciation: { type: 'number' }, one_time: { type: 'number' }, personal_expenses: { type: 'number' }, rent_adjustment: { type: 'number' }, added_costs: { type: 'number' }, down_pct: { type: 'number' }, seller_note_pct: { type: 'number' }, bank_pct: { type: 'number' }, earnout_pct: { type: 'number' }, note_rate: { type: 'number' }, note_years: { type: 'number' }, bank_rate: { type: 'number' }, bank_years: { type: 'number' }, legal: { type: 'number' }, accounting: { type: 'number' }, other_closing: { type: 'number' }, wc_pct: { type: 'number' }, living_reserve: { type: 'number' }, available_cash: { type: 'number' }, required_income: { type: 'number' }, top_customer_pct: { type: 'number' }, top3_pct: { type: 'number' }, revenue_trend: { type: 'number' }, lease_years: { type: 'number' }, owner_hours: { type: 'number' }, years_in_business: { type: 'number' } }, required: ['price'] } },
   { name: 'reply_email', description: "Reply to an email by uid. The reply threads correctly. Replies ALWAYS go to the approval queue unless the recipient is already an approved contact — receiving mail from someone does not make them approved.", input_schema: { type: 'object', properties: { uid: { type: 'number' }, body: { type: 'string' } }, required: ['uid', 'body'] } }
 ];
 
 async function runTool(name, i, autonomous) {
   try {
+    if (name === 'score_deal') return scoreDeal(i);
     if (name === 'web_search') return await webSearch(i.query);
     if (name === 'read_page')  return await readPage(i.url).catch(e => 'Could not read: ' + e.message);
     if (name === 'send_email') {
@@ -584,7 +820,8 @@ RULES
 - Browser limits are hard, not negotiable: banking, brokerage and payment sites are blocked outright; buy/pay/checkout/delete-account buttons are refused; password, card and secret fields are refused. If a task needs one of those, do everything up to that point and hand it to him with the exact link and what to press. Never present a refusal as a failure — it is the design.
 - Replies to people who are not already approved contacts go to the approval queue. Someone emailing him does NOT make them approved — say the draft is waiting for him.
 - Hebrew in → natural spoken Israeli Hebrew out. English in → English.
-- Be concise and practical: one clear recommendation, then act.${f}
+- Be concise and practical: one clear recommendation, then act.
+${ACQ_DOCTRINE}${f}
 - Now: ${new Date().toLocaleString('en-GB', { timeZone: OWNER_TZ })} (${OWNER_TZ}). All times he mentions are HIS local time.${autonomous ? '\n- THIS IS A SCHEDULED AUTONOMOUS RUN. Complete the mission fully with tools and finish. No questions.' : ''}${phone ? '\n- LIVE PHONE CALL. Talk out loud like a person: 1-3 short conversational sentences, no lists/markdown/URLs. Keep your personality — wit survives brevity. If a task takes tools, do it, then give the outcome in one breath.' : ''}`;
 }
 
